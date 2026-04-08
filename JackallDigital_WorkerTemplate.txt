@@ -1,0 +1,972 @@
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    let token = getCookie(request, 'shortener_token');
+    if (!token) {
+      token = url.searchParams.get('token');
+    }
+
+    const departments = getDepartments(env);
+    const allowedTokens = departments.map(d => d.token);
+
+    const isLoggedIn = token && allowedTokens.includes(token);
+
+    // === LOGIN / DASHBOARD ===
+    if (path === '/login' || path === '/login/') {
+      if (!isLoggedIn) {
+        return htmlResponse(renderLoginPage(), 401);
+      }
+
+      const linkList = await getVisibleLinks(env, token, url.host);
+
+      const departmentName = getDepartmentName(env, token);
+      return htmlResponse(renderDashboardPage(linkList, {}, departmentName), 200, {
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+        'Set-Cookie': buildSessionCookie(token)
+      });
+    }
+
+    // === CREATE SHORT LINK ===
+    if (path === '/shorten' && request.method === 'POST') {
+      if (!isLoggedIn) {
+        return Response.redirect(`${url.origin}/login`, 302);
+      }
+
+      const form = await request.formData();
+      const longUrl = String(form.get('url') || '').trim();
+      
+      let slug = sanitizeSlug(form.get('slug'));
+
+    if (!longUrl) {
+      const linkList = await getVisibleLinks(env, token, url.host);
+
+      return htmlResponse(
+        renderDashboardPage(linkList, {
+          longUrl,
+          slug,
+          slugError: 'Please enter a valid long URL.'
+        }),
+        400,
+          {
+            'Set-Cookie': buildSessionCookie(token)
+          }
+        );
+    }
+
+	  if (!slug) {
+		  slug = await generateUniqueSlug(env, 7);
+	  }
+    else {
+		  const existing = await env.KV.get(slug);
+
+		  if (existing) {
+        const linkList = await getVisibleLinks(env, token, url.host);
+
+        return htmlResponse(
+        renderDashboardPage(linkList, {
+          longUrl,
+          slug,
+          slugError: 'This short code already exists. Please choose another one.'
+        }),
+        409,
+        {
+          'Set-Cookie': buildSessionCookie(token)
+        }
+        );
+      }
+	  }
+
+    const createdAt = Date.now();
+    const createdBy = getDepartmentName(env, token);
+
+    const data = JSON.stringify({
+      createdOn: new Date(createdAt).toISOString().slice(0, 10),
+      createdBy,
+      url: longUrl,
+      createdAt
+    });
+
+	  await env.KV.put(slug, data);
+
+	  const shortLink = `https://${url.host}/${slug}`;
+	  const cacheBuster = Date.now();
+
+	  return htmlResponse(
+      renderCreatedPage(shortLink, cacheBuster),
+      200,
+      {
+        'Set-Cookie': buildSessionCookie(token)
+      }
+    );
+	}
+
+    // === LOGOUT ===
+    if (path === '/logout') {
+      return htmlResponse(
+        renderMessagePage(
+          'You have been logged out',
+          '<p class="message-text">Your session has ended successfully.</p><p><a class="link-button" href="/login">Go back to login</a></p>'
+        ),
+        200,
+        {
+          'Set-Cookie': clearSessionCookie(),
+          'Cache-Control': 'no-store'
+        }
+      );
+    }
+
+    // === REDIRECT ===
+    const slug = path.substring(1);
+    if (slug && slug !== 'login' && slug !== 'logout' && slug !== 'shorten') {
+      const stored = await env.KV.get(slug);
+      if (stored) {
+        try {
+          const data = JSON.parse(stored);
+          return Response.redirect(data.url, 301);
+        } catch (e) {
+          return Response.redirect(stored, 301);
+        }
+      }
+    }
+
+    return htmlResponse(
+      renderMessagePage(
+        'Shorties',
+        '<p class="message-text">Welcome to Shorties.</p><p><a class="link-button" href="/login">Go to login</a></p>'
+      )
+    );
+  }
+};
+
+// =========================
+// Rendering
+// =========================
+
+function renderLoginPage() {
+  const content = `
+    <div class="auth-wrap">
+      <div class="brand-mark">go.shorties</div>
+      <h1 class="page-title">Shorties</h1>
+      <p class="page-subtitle">Log in with your <i>secret</i> password.</p>
+
+      <form method="get" action="/login" class="card form-card">
+        <label class="field-label" for="token">Secret password</label>
+        <input
+          id="token"
+          type="password"
+          name="token"
+          placeholder="Enter your password"
+          autocomplete="off"
+          class="input"
+          required
+        >
+        <button type="submit" class="button button-primary button-full">Login</button>
+      </form>
+    </div>
+  `;
+
+  return renderLayout('go.shorties', content);
+}
+
+function renderDashboardPage(linkList, formState = {}, departmentName = '') {
+  const linksHtml = renderLinksList(linkList);
+  const longUrlValue = escapeHtml(formState.longUrl || '');
+  const slugValue = escapeHtml(formState.slug || '');
+  const slugError = formState.slugError || '';
+
+  const content = `
+    <div class="topbar">
+      <div>
+        <div class="brand-mark">go.shorties</div>
+        <h1 class="page-title page-title-left">Short Links</h1>
+        <p class="page-subtitle page-subtitle-left">
+          You are logged in as <span class="department-name">${escapeHtml(departmentName)}</span>.
+          Session lasts <span id="session-minutes">30:00</span>.
+        </p>
+      </div>
+      <div class="topbar-actions">
+        <a href="/logout" class="button button-danger button-small">Logout</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <h2 class="section-title">Create short link</h2>
+
+        <form method="post" action="/shorten" class="form-stack">
+          <div>
+            <label class="field-label" for="url">Long URL</label>
+            <input
+              id="url"
+              type="url"
+              name="url"
+              placeholder="https://..."
+              required
+              class="input"
+              value="${longUrlValue}"
+            >
+          </div>
+
+          <div>
+            <label class="field-label" for="slug">Custom short code <span class="muted">(optional)</span></label>
+            <input
+              id="slug"
+              type="text"
+              name="slug"
+              placeholder="spring-promo"
+              class="input ${slugError ? 'input-error' : ''}"
+              value="${slugValue}"
+            >
+            ${slugError ? `<p class="field-error">${escapeHtml(slugError)}</p>` : ''}
+          </div>
+
+          <button type="submit" class="button button-primary">Create Short Link</button>
+        </form>
+      </section>
+
+      <section class="card" style="height:620px; overflow:auto">
+        <h2 class="section-title">Recently created links</h2>
+        ${linksHtml}
+      </section>
+    </div>
+  `;
+
+  return renderLayout('go.shorties', content);
+}
+
+function renderCreatedPage(shortLink, cacheBuster) {
+  const escapedShortLink = escapeHtml(shortLink);
+
+  const content = `
+    <div class="center-wrap">
+      <div class="topbar" style="margin-bottom:0px">
+        <div class="brand-mark">go.shorties</div>
+        <div class="topbar-actions">
+          <a href="/logout" class="button button-danger button-small">Logout</a>
+        </div>
+      </div>
+      <div class="card success-card">
+        <div class="success-icon">✓</div>
+        <h1 class="page-title">Shorty created</h1>
+        <p class="page-subtitle">Your new shorty is ready to use.</p>
+
+        <div class="result-box">
+          <div class="result-link">${escapedShortLink}</div>
+          <button
+            type="button"
+            class="button button-secondary button-small"
+            onclick="copyToClipboard('${escapeJsString(shortLink)}')"
+          >
+            Copy
+          </button>
+        </div>
+
+        <div class="message-actions">
+          <a class="link-button" href="/login?ts=${cacheBuster}">Create another link</a>
+        </div>
+      </div>
+    </div>
+  `;
+
+  return renderLayout('go.shorties', content);
+}
+
+function renderMessagePage(title, bodyHtml) {
+  const content = `
+    <div class="center-wrap">
+      <div class="brand-mark">go.shorties</div>
+      <div class="card message-card">
+        <h1 class="page-title">${escapeHtml(title)}</h1>
+        ${bodyHtml}
+      </div>
+    </div>
+  `;
+
+  return renderLayout('go.shorties', content);
+}
+
+function renderLinksList(linkList) {
+  if (!linkList.length) {
+    return `<p class="empty-state">No links found yet.</p>`;
+  }
+
+  const items = linkList.map((item) => {
+    const hasFullLink = item.fullUrl.length > 35;
+    const id = item.createdAt;
+    const shortUrlSafe = escapeHtml(item.shortUrl);
+    const displayLongSafe = escapeHtml(item.displayLong);
+    const fullUrlJs = escapeJsString(item.fullUrl);
+
+    return `
+      <li class="link-item">
+        <div class="link-row">
+          <div class="link-main">
+            <div class="short-url">${shortUrlSafe}</div>
+            <div class="long-url-row">
+              <span id="long-${id}" class="long-url-text">${displayLongSafe}</span>
+              ${
+                hasFullLink
+                  ? `<a
+                      href="#"
+                      id="toggle-${id}"
+                      class="text-link"
+                      data-expanded="false"
+                      onclick="toggleFull('${fullUrlJs}', ${id}); return false;"
+                    >Show full</a>`
+                  : ''
+              }
+            </div>
+          </div>
+
+          <div class="link-actions">
+            <button
+              type="button"
+              class="button button-secondary button-small"
+              onclick="copyToClipboard('${escapeJsString(item.shortUrl)}')"
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+      </li>
+    `;
+  }).join('');
+
+  return `<ul class="links-list">${items}</ul>`;
+}
+
+function renderLayout(title, content) {
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${escapeHtml(title)}</title>
+        <style>
+          :root {
+            --bg: #ceebd0;
+            --card: #f8fffa;
+            --card-border: #b7e2c6;
+            --text: #3cab05;
+            --muted: #9fa99f;
+            --primary: #2fd114;
+            --primary-hover: #541df7;
+            --secondary-bg: #541df7;
+            --secondary-text: #ffffff;
+            --danger: #2fd114;
+            --danger-hover: #541df7;
+            --success-bg: #ecfdf3;
+            --success-text: #541df7;
+            --shadow: 0 12px 34px rgba(16, 24, 40, 0.08);
+            --radius: 18px;
+          }
+
+          * {
+            box-sizing: border-box;
+          }
+
+          html, body {
+            margin: 0;
+            padding: 0;
+          }
+
+          body {
+            font-family: Arial, Helvetica, sans-serif;
+            background:
+              radial-gradient(circle at top left, rgba(27, 92, 255, 0.08), transparent 28%),
+              linear-gradient(180deg, #f8fbff 0%, var(--bg) 100%);
+            color: var(--text);
+            min-height: 100vh;
+          }
+
+          a {
+            color: inherit;
+          }
+
+          .shell {
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 40px 20px 56px;
+          }
+
+          .auth-wrap,
+          .center-wrap {
+            max-width: 520px;
+            margin: 56px auto 0;
+          }
+
+          .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+            margin-bottom: 24px;
+          }
+
+          .topbar-actions {
+            flex-shrink: 0;
+          }
+
+          .brand-mark {
+            display: inline-block;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--primary);
+            background: rgba(22, 221, 39, 0.08);
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+          }
+
+          .page-title {
+            margin: 0 0 10px;
+            font-size: 32px;
+            line-height: 1.15;
+          }
+
+          .page-title-left {
+            font-size: 30px;
+          }
+
+          .page-subtitle {
+            margin: 0;
+            color: var(--muted);
+            font-size: 16px;
+            line-height: 1.5;
+          }
+
+          .page-subtitle-left {
+            max-width: 640px;
+          }
+
+          .grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+          }
+
+          .card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 28px;
+          }
+
+          .form-card,
+          .message-card,
+          .success-card {
+            padding: 32px;
+          }
+
+          .section-title {
+            margin: 0 0 20px;
+            font-size: 22px;
+          }
+
+          .form-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+          }
+
+          .field-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 8px;
+          }
+
+          .input {
+            width: 100%;
+            border: 1px solid #cfd8e3;
+            border-radius: 12px;
+            padding: 14px 16px;
+            font-size: 16px;
+            color: var(--text);
+            background: #fff;
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+          }
+
+          .input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 4px rgba(27, 92, 255, 0.12);
+          }
+
+          .button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            border: 0;
+            border-radius: 12px;
+            padding: 12px 18px;
+            font-size: 15px;
+            font-weight: 700;
+            text-decoration: none;
+            cursor: pointer;
+            transition: background 0.15s ease, transform 0.05s ease;
+          }
+
+          .button:hover,
+          .link-button:hover,
+          .text-link:hover {
+            text-decoration: none;
+          }
+
+          .button:active {
+            transform: translateY(1px);
+          }
+
+          .button-full {
+            width: 100%;
+          }
+
+          .button-small {
+            padding: 9px 14px;
+            font-size: 14px;
+          }
+
+          .button-primary {
+            background: var(--primary);
+            color: #fff;
+          }
+
+          .button-primary:hover {
+            background: var(--primary-hover);
+          }
+
+          .button-secondary {
+            background: var(--secondary-bg);
+            color: var(--secondary-text);
+          }
+
+          .button-secondary:hover {
+            background: #2fd114;
+          }
+
+          .button-secondary:active{
+           background: #8b8b8b
+          }
+
+          .button-secondary:focus{
+           background: #8b8b8b
+          }
+
+          .button-danger {
+            background: var(--danger);
+            color: #ffffff;
+          }
+
+          .button-danger:hover {
+            background: var(--danger-hover);
+          }
+
+          .links-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+          }
+
+          .link-item + .link-item {
+            margin-top: 14px;
+          }
+
+          .link-item {
+            border: 1px solid #e4eaf2;
+            border-radius: 14px;
+            padding: 16px;
+            background: #fbfcfe;
+          }
+
+          .link-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 14px;
+          }
+
+          .link-main {
+            min-width: 0;
+            flex: 1;
+          }
+
+          .short-url {
+            font-size: 16px;
+            font-weight: 700;
+            word-break: break-word;
+            margin-bottom: 8px;
+          }
+
+          .long-url-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+          }
+
+          .long-url-text {
+            color: var(--muted);
+            word-break: break-word;
+          }
+
+          .text-link {
+            color: var(--primary);
+            font-size: 14px;
+            text-decoration: none;
+            font-weight: 700;
+          }
+
+          .muted {
+            color: var(--muted);
+            font-weight: 400;
+          }
+
+          .empty-state,
+          .message-text {
+            color: var(--muted);
+            font-size: 16px;
+            line-height: 1.5;
+            margin: 0;
+          }
+
+          .result-box {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 24px;
+            padding: 16px;
+            border: 1px solid #dbe4f0;
+            border-radius: 14px;
+            background: #f8fbff;
+          }
+
+          .result-link {
+            font-size: 14px;
+            font-weight: 200;
+            word-break: break-word;
+          }
+
+          .success-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 999px;
+            background: var(--success-bg);
+            color: var(--success-text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            font-weight: 700;
+            margin: 0 auto 18px;
+          }
+
+          .success-card,
+          .message-card {
+            text-align: center;
+          }
+
+          .message-actions {
+            margin-top: 22px;
+          }
+
+          .link-button {
+            display: inline-block;
+            padding: 12px 18px;
+            border-radius: 12px;
+            background: var(--primary);
+            color: #fff;
+            text-decoration: none;
+            font-weight: 700;
+          }
+
+          .link-button:hover {
+            background: var(--primary-hover);
+          }
+
+          .department-name {
+            color: #541df7;
+            font-weight: 700;
+          }
+		  
+          .input-error {
+            border-color: #d92d20;
+            box-shadow: 0 0 0 4px rgba(217, 45, 32, 0.10);
+          }
+
+          .field-error {
+            margin: 8px 0 0;
+            font-size: 14px;
+            color: #d92d20;
+            font-weight: 700;
+          }
+
+          @media (max-width: 720px) {
+            .shell {
+              padding: 24px 14px 40px;
+            }
+
+            .card,
+            .form-card,
+            .message-card,
+            .success-card {
+              padding: 20px;
+            }
+
+            .page-title,
+            .page-title-left {
+              font-size: 26px;
+            }
+
+            .topbar {
+              flex-direction: column;
+              align-items: stretch;
+            }
+
+            .link-row {
+              flex-direction: column;
+            }
+
+            .link-actions {
+              width: 100%;
+            }
+
+            .link-actions .button {
+              width: 100%;
+            }
+
+            .result-box {
+              flex-direction: column;
+            }
+          }
+        </style>
+        <script>
+          function copyToClipboard(text) {
+            navigator.clipboard.writeText(text);
+          }
+
+          function toggleFull(fullUrl, id) {
+            const longSpan = document.getElementById('long-' + id);
+            const toggleLink = document.getElementById('toggle-' + id);
+
+            if (!longSpan || !toggleLink) return;
+
+            const expanded = toggleLink.dataset.expanded === 'true';
+
+            if (!expanded) {
+              longSpan.textContent = fullUrl;
+              toggleLink.textContent = 'Hide';
+              toggleLink.dataset.expanded = 'true';
+            } else {
+              longSpan.textContent = fullUrl.length > 35 ? fullUrl.substring(0, 35) + '...' : fullUrl;
+              toggleLink.textContent = 'Show full';
+              toggleLink.dataset.expanded = 'false';
+            }
+          }
+
+          function startSessionCountdown(seconds = 1800) {
+            const el = document.getElementById('session-minutes');
+            if (!el) return;
+
+            let remaining = seconds;
+
+            function render() {
+              const mins = Math.floor(remaining / 60);
+              const secs = remaining % 60;
+              el.textContent = mins + ':' + String(secs).padStart(2, '0');
+            }
+
+            render();
+
+            const timer = setInterval(() => {
+              remaining--;
+
+              if (remaining <= 0) {
+                clearInterval(timer);
+                el.textContent = 'expired';
+
+                window.location.href = '/logout';
+                return;
+              }
+
+              render();
+            }, 1000);
+          }
+
+          window.addEventListener('load', () => {
+            startSessionCountdown(1800);
+          });
+        </script>
+      </head>
+      <body>
+        <main class="shell">
+          ${content}
+        </main>
+      </body>
+    </html>
+  `;
+}
+
+// =========================
+// Helpers
+// =========================
+
+function htmlResponse(html, status = 200, extraHeaders = {}) {
+  return new Response(html, {
+    status,
+    headers: {
+      'Content-Type': 'text/html; charset=UTF-8',
+      ...extraHeaders
+    }
+  });
+}
+
+function buildSessionCookie(token) {
+  return `shortener_token=${token}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict`;
+}
+
+function clearSessionCookie() {
+  return `shortener_token=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+}
+
+function getCookie(request, name) {
+  const cookieHeader = request.headers.get('Cookie');
+  if (!cookieHeader) return null;
+
+  const cookies = cookieHeader.split(';').map((c) => c.trim());
+  for (const cookie of cookies) {
+    if (cookie.startsWith(name + '=')) {
+      return cookie.substring(name.length + 1);
+    }
+  }
+
+  return null;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeJsString(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/<\/script>/gi, '<\\/script>');
+}
+
+async function getVisibleLinks(env, token, host) {
+  const { keys } = await env.KV.list({ limit: 100 });
+  const linkList = [];
+  const isAdmin = token === env.ADMIN_TOKEN;
+  const currentDepartment = getDepartmentName(env, token);
+
+  for (const key of keys) {
+    const stored = await env.KV.get(key.name);
+    if (!stored) continue;
+
+    let longUrl = '';
+    let createdAt = 0;
+    let createdBy = '';
+
+    try {
+      const data = JSON.parse(stored);
+      longUrl = data.url || stored;
+      createdAt = data.createdAt || Date.now();
+      createdBy = data.createdBy || '';
+    } catch (e) {
+      longUrl = stored || '';
+      createdAt = Date.now();
+    }
+
+    if (!isAdmin && createdBy !== currentDepartment) continue;
+
+    const shortUrl = `https://${host}/${key.name}`;
+    const displayLong =
+      longUrl.length > 35 ? longUrl.substring(0, 35) + '...' : longUrl;
+
+    linkList.push({
+      shortUrl,
+      fullUrl: longUrl,
+      displayLong,
+      createdAt
+    });
+  }
+
+  linkList.sort((a, b) => b.createdAt - a.createdAt);
+  return linkList;
+}
+
+async function generateUniqueSlug(env, length = 7) {
+  const maxAttempts = 20;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const slug = generateRandomSlug(length);
+    const existing = await env.KV.get(slug);
+
+    if (!existing) {
+      return slug;
+    }
+  }
+
+  throw new Error('Could not generate a unique slug.');
+}
+
+function generateRandomSlug(length = 7) {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += alphabet[bytes[i] % alphabet.length];
+  }
+
+  return result;
+}
+
+function getDepartments(env) {
+  return [
+    { token: env.ADMIN_TOKEN, name: 'ADMIN' },
+    { token: env.MARKETING_TOKEN, name: 'MARKETING' },
+    { token: env.IT_TOKEN, name: 'IT' },
+    { token: env.SALES_TOKEN, name: 'SALES' },
+    { token: env.PRODUCTION_TOKEN, name: 'PRODUCTION' },
+    { token: env.LOGISTICS_TOKEN, name: 'LOGISTICS' }
+  ].filter(d => d.token);
+}
+
+function getDepartmentName(env, token) {
+  if (token === env.ADMIN_TOKEN) return 'Admin';
+  if (token === env.MARKETING_TOKEN) return 'Marketing';
+  if (token === env.IT_TOKEN) return 'IT';
+  if (token === env.SALES_TOKEN) return 'Sales';
+  if (token === env.PRODUCTION_TOKEN) return 'Production';
+  if (token === env.LOGISTICS_TOKEN) return 'Logistics';
+  return 'Unknown';
+}
+
+function sanitizeSlug(input) {
+  return String(input || '')
+    .trim()
+    //.toLowerCase()
+    .replace(/\s+/g, '-')         // spaces -> single dash
+    .replace(/[^a-zA-Z0-9-]/g, '') // remove everything except letters, numbers, dash
+    .replace(/-+/g, '-')          // collapse repeated dashes
+    .replace(/^-|-$/g, '');       // trim leading/trailing dashes
+}
